@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bayesn-td"
+version = "0.1.1"
+description = "BayeSN for strongly-lensed Type Ia supernovae time-delay cosmography"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Matthew Grayling"},
+    {name = "Stephen Thorp"},
+    {name = "Kaisey S. Mandel"},
+]
+keywords = [
+    "supernovae",
+    "cosmology",
+    "time-delay",
+    "gravitational-lensing",
+    "bayesian",
+    "jax",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "matplotlib",
+    "jax>=0.4.14,<0.10",
+    "jaxlib>=0.4.14,<0.10",
+    "numpyro",
+    "astropy",
+    "h5py",
+    "extinction",
+    "arviz",
+    "ruamel.yaml",
+    "tqdm",
+]
+
+[project.urls]
+Homepage = "https://github.com/mattgrayling/bayesn-td"
+Documentation = "https://bayesn-td.readthedocs.io"
+Repository = "https://github.com/mattgrayling/bayesn-td"
+Issues = "https://github.com/mattgrayling/bayesn-td/issues"
+Paper = "https://doi.org/10.1093/mnras/stag340"
+
+[project.scripts]
+run_bayesn_td = "bayesn_td.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["bayesn_td*"]
+
+[tool.setuptools.package-data]
+bayesn_td = [
+    "hsiao.h5",
+    "filters/**/*",
+    "model_files/**/*",
+]

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+.idea/
+.claude/
+.DS_Store
+*.pkl
+*.npy
+results/
+plots/
+docs/_build/

@@ -1,0 +1,48 @@
+cff-version: 1.2.0
+title: bayesn-td
+message: "If you use this software, please cite the associated paper (Grayling et al. 2026) as well as this software record."
+type: software
+authors:
+  - family-names: Grayling
+    given-names: Matthew
+  - family-names: Thorp
+    given-names: Stephen
+  - family-names: Mandel
+    given-names: Kaisey S.
+license: MIT
+repository-code: "https://github.com/mattgrayling/bayesn-td"
+url: "https://bayesn-td.readthedocs.io"
+preferred-citation:
+  type: article
+  title: "BayeSN-TD: Time Delay and H_0 Estimation for Lensed SN H0pe"
+  year: 2026
+  authors:
+    - family-names: Grayling
+      given-names: Matthew
+    - family-names: Thorp
+      given-names: Stephen
+    - family-names: Mandel
+      given-names: Kaisey S.
+    - family-names: Pascale
+      given-names: M.
+    - family-names: Pierel
+      given-names: J. D. R.
+    - family-names: Hayes
+      given-names: E. E.
+    - family-names: Larison
+      given-names: C.
+    - family-names: Agrawal
+      given-names: A.
+    - family-names: Narayan
+      given-names: G.
+  journal: Monthly Notices of the Royal Astronomical Society
+  volume: 548
+  issue: 2
+  doi: 10.1093/mnras/stag340
+  identifiers:
+    - type: doi
+      value: 10.1093/mnras/stag340
+    - type: other
+      value: "arXiv:2510.11719"
+      description: arXiv preprint
+  url: "https://doi.org/10.1093/mnras/stag340"

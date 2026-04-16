@@ -1,0 +1,21 @@
+# BayeSN model
+load_model: G26x_model
+
+# MCMC configuration
+num_samples: 500
+num_warmup: 500
+num_chains: 4
+chain_method: parallel
+init_strategy: median
+include_eps: false
+include_ml: false
+
+# Output directory
+outputdir: results/sim_lensed_sn
+
+# Data specification
+# Column names and metadata (peak_mjds, z, ebv_mw) are auto-detected from
+# the ECSV file header.
+data:
+  photometry: examples/sim_lensed_sn/photometry.ecsv
+  sn_name: sim_lensed_sn
