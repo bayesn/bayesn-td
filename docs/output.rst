@@ -4,7 +4,7 @@ Output
 =======
 
 After fitting, bayesn-td writes several files to the output directory specified
-by the ``output`` argument (in Python) or the ``outputdir`` key (in the YAML
+by the ``outputdir`` argument (in Python) or the ``outputdir`` key (in the YAML
 input file).
 
 chains.pkl
@@ -21,7 +21,10 @@ A pickled Python dictionary containing the processed MCMC samples:
 
 The dictionary contains the following keys. The intrinsic SN parameters are
 shared across images, while the per-image parameters and derived quantities
-each have an ``images`` dimension.
+each have an ``images`` dimension. SNe are on the last axis, in the order of
+``sn_list.txt``. When SNe with different numbers of images are fitted
+together, the ``images`` axis has the size of the largest, and entries for
+images an SN does not have are ``NaN``.
 
 Shared SN parameters
 ~~~~~~~~~~~~~~~~~~~~~
@@ -34,6 +37,7 @@ Shared SN parameters
 - ``eps`` — residual colour variation :math:`\epsilon` (if ``include_eps``
   was ``True``). Stored as a flat vector of spline knot coefficients
   (excluding boundary knots, which are zero by construction).
+  Shape: ``(chains, samples, knots, SNe)``.
 
 Per-image parameters
 ~~~~~~~~~~~~~~~~~~~~~
@@ -57,16 +61,13 @@ These are computed in post-processing from the sampled parameters:
   Shape: ``(chains, samples, images, SNe)``.
 - ``mu`` — distance modulus per image, drawn in post-processing from a
   Normal whose mean is the precision-weighted average of the sampled
-  :math:`D_s` and the fiducial distance modulus :math:`\hat\mu` (computed from
-  the source redshift and the fiducial cosmology), with variance set by the
-  BayeSN intrinsic scatter :math:`\sigma_0`.
+  :math:`D_s` and the fiducial distance modulus :math:`\hat\mu`, with
+  variance set by the BayeSN intrinsic scatter :math:`\sigma_0`.
   Shape: ``(chains, samples, images, SNe)``.
 - ``delM`` — grey offset :math:`\delta M = D_s - \mu`.
   Shape: ``(chains, samples, images, SNe)``.
 - ``delta`` — Hubble residual :math:`\delta = \mu - \hat\mu`, where
-  :math:`\hat\mu` is the distance modulus computed from the source redshift
-  and the fiducial cosmology (flat :math:`\Lambda\mathrm{CDM}` with
-  :math:`H_0 = 73.24`, :math:`\Omega_m = 0.28` by default).
+  :math:`\hat\mu` is the fiducial distance modulus.
   Shape: ``(chains, samples, images, SNe)``.
 
 Microlensing parameters
@@ -83,20 +84,21 @@ These are only present if ``include_ml`` was ``True``:
 - ``eta`` — GP modulation width. Shape: ``(chains, samples, images, SNe)``.
 - ``beta_t`` — realised GP function values (the microlensing signal in
   magnitude space). The same magnitude offset is applied to all bands at
-  each epoch.
+  each epoch. Shape: ``(chains, samples, images, observations, 1, SNe)``,
+  where ``observations`` is the padded light-curve length.
 
 Diagnostics
 ~~~~~~~~~~~~
 
 - ``diverging`` — boolean array indicating divergent transitions.
+  Shape: ``(chains, samples, SNe)``.
 
 initial_chains.pkl
 -------------------
 
-The raw MCMC output before post-processing. This contains the same sample
+The MCMC output before post-processing. This contains the same sample
 arrays as ``chains.pkl`` but without the derived quantities (``delta_t``,
-``peak_mjd``, ``mu``, ``delM``, ``delta``), and before any reshaping of
-the sample dimensions.
+``peak_mjd``, ``mu``, ``delM``, ``delta``).
 
 fit_summary.csv
 ----------------
@@ -112,5 +114,9 @@ converged.
 sn_list.txt
 -------------
 
-A small CSV file recording the SN name(s) and, if provided, the true time
-delays (for simulated data or validation purposes).
+A CSV file with one row per fitted SN, in the same order as the SN axis of the
+samples: the SN name (``SNID``), number of images (``n_images``), heliocentric and
+CMB-frame redshifts (``z``, ``z_cmb``), Milky Way E(B-V) (``ebv_mw``), fiducial
+distance modulus (``muhat``), image labels (``image_<i>``) and estimated peaks
+(``peak_mjd_<i>``), plus any extra columns of the ``metadata`` table (e.g. true
+parameter values for simulations).

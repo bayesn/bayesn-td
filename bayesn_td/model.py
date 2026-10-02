@@ -3,7 +3,9 @@ BayeSN SED Model. Defines a class which allows you to fit or simulate from the
 BayeSN Optical+NIR SED model for strongly-lensed Type Ia supernovae.
 """
 
+import inspect
 import os
+import re
 import timeit
 import pickle
 import numpy as np
@@ -14,7 +16,7 @@ import pandas as pd
 import jax
 from jax import device_put
 import jax.numpy as jnp
-from jax.random import PRNGKey, split
+from jax.random import PRNGKey
 from jax.scipy.stats import norm
 from jax.scipy.special import ndtri
 from astropy.cosmology import FlatLambdaCDM
@@ -29,11 +31,27 @@ from numpyro.infer import MCMC, NUTS, init_to_median, init_to_sample
 import arviz
 
 from .spline_utils import invKD_irr, spline_coeffs_irr
+from .io import ZPT, read_photometry, read_text_table, write_ecsv
 
 yaml = YAML(typ='safe')
 yaml.default_flow_style = False
 
 jax.config.update('jax_enable_x64', True)
+
+# fluxerr given to padded (masked) observations: with flux and model both 0 there, their Normal log-density is
+# exactly 0
+PAD_FLUXERR = 1 / np.sqrt(2 * np.pi)
+
+# Width (mag) of the Normal prior on each image's distance modulus Ds, centred on the fiducial value
+DS_PRIOR_WIDTH = 5
+
+# Random seed for the MCMC and for post-processing draws
+SEED = 123
+
+# Keys of the padded photometry arrays passed to td_model, each with shape (n_obs, n_images, n_sn) except muhat,
+# which has shape (n_images, n_sn): rest-frame phase relative to the estimated peak, FLUXCAL flux and error, band
+# index into the bands in use, mask (False for padding) and fiducial distance modulus
+OBS_KEYS = ('phase', 'flux', 'fluxerr', 'band', 'mask', 'muhat')
 
 
 class SEDmodel:
@@ -69,10 +87,11 @@ class SEDmodel:
 
         self.cosmo = FlatLambdaCDM(**fiducial_cosmology)
         self.data = None
+        self.sn_list = None
+        self.dropped = None
         self.hsiao_interp = None
         self.RV_MW = device_put(jnp.array(3.1))
         self.sigma_pec = device_put(jnp.array(150 / 3e5))
-        self.sn_list = None
         self.filter_yaml = filter_yaml
         built_in_models = [d for d in next(os.walk(os.path.join(self.__root_dir__, 'model_files')))[1]
                            if os.path.exists(os.path.join(self.__root_dir__, 'model_files', d, 'BAYESN.YAML'))]
@@ -116,7 +135,7 @@ class SEDmodel:
         self.KD_t = device_put(invKD_irr(self.tau_knots))
         self._load_hsiao_template()
 
-        self.ZPT = 27.5
+        self.ZPT = ZPT
         self.J_l_T = device_put(self.J_l_T)
         self.hsiao_flux = device_put(self.hsiao_flux)
         self.J_l_T_hsiao = device_put(self.J_l_T_hsiao)
@@ -298,10 +317,6 @@ class SEDmodel:
         self.band_interpolate_weights = jnp.array(band_weights)
         self.model_wave = 10 ** model_log_wave
         self.used_band_dict = {val: val for val in self.band_dict.values()}
-
-        self._full_zps = self.zps
-        self._full_offsets = self.offsets
-        self._full_used_band_inds = self.used_band_inds
 
     def _calculate_band_weights(self, redshifts, ebv):
         """
@@ -513,14 +528,15 @@ class SEDmodel:
 
     # --- Numpyro probabilistic model ---
 
-    def td_model(self, obs, weights, include_eps=True, include_ml=True):
+    def td_model(self, data, weights, include_eps=True, include_ml=True):
         """
         Unified numpyro probabilistic model for time-delay fitting of lensed SNe Ia.
 
         Parameters
         ----------
-        obs : array-like
-            Observation data tensor from process_dataset.
+        data : dict
+            Padded photometry arrays (keys ``OBS_KEYS``) for SNe with the same number of images, from
+            ``process_dataset``.
         weights : array-like
             Band weights from _calculate_band_weights.
         include_eps : bool, optional
@@ -528,8 +544,8 @@ class SEDmodel:
         include_ml : bool, optional
             Whether to include microlensing GP model. Default True.
         """
-        sample_size = obs.shape[-1]
-        n_img = obs.shape[-2]
+        sample_size = data['flux'].shape[-1]
+        n_img = data['flux'].shape[-2]
         N_knots_sig = (self.l_knots.shape[0] - 2) * self.tau_knots.shape[0]
 
         if hasattr(self, 'mu_R'):
@@ -562,9 +578,7 @@ class SEDmodel:
 
             with numpyro.plate('img', n_img) as img_index:
                 tmax = numpyro.sample('tmax', dist.Uniform(-10, 10))
-                muhat = obs[-3, 0, :, :]
-                muhat_err = 5
-                Ds = numpyro.sample('Ds', dist.Normal(muhat, muhat_err))
+                Ds = numpyro.sample('Ds', dist.Normal(data['muhat'], DS_PRIOR_WIDTH))
 
                 if include_ml:
                     A = numpyro.sample('A', dist.HalfNormal(0.1))
@@ -573,9 +587,9 @@ class SEDmodel:
                     p = numpyro.sample('p', dist.Uniform(0, 1))
                     eta = numpyro.sample('eta', dist.Uniform(1, 40))
                     beta_t_tform = numpyro.sample('beta_t_tform',
-                                                  dist.MultivariateNormal(0, jnp.eye(obs[0, ...].shape[0])))
+                                                  dist.MultivariateNormal(0, jnp.eye(data['phase'].shape[0])))
 
-            t = obs[0, ...] - tmax[None, ...]
+            t = data['phase'] - tmax[None, ...]
 
             if include_ml:
                 tt = t[:, None, ...] - t[None, ...]
@@ -589,468 +603,313 @@ class SEDmodel:
                 beta_t = numpyro.deterministic('beta_t', jnp.matmul(L_K, beta_t_tform[..., None]))
                 beta_t = beta_t[..., 0].transpose(2, 0, 1)
             else:
-                beta_t = jnp.zeros(self.data.shape[1:])
+                beta_t = jnp.zeros(data['flux'].shape)
 
             hsiao_interp = jnp.array([19 + jnp.floor(t), 19 + jnp.ceil(t), jnp.remainder(t, 1)])
             keep_shape = t.shape
             t = t.flatten(order='F')
             J_t = self.J_t_map(t, self.tau_knots, self.KD_t).reshape(
                 (*keep_shape, self.tau_knots.shape[0]), order='F').transpose(2, 1, 3, 0)
-            band_indices = obs[-6, ...].astype(int)
-            mask = obs[-1, ...].astype(bool)
-
             flux = self.get_flux_batch(theta, Av, self.W0, self.W1, eps, Ds, RV,
-                                       band_indices, mask, J_t, hsiao_interp, weights, beta_t)
+                                       data['band'], data['mask'], J_t, hsiao_interp, weights, beta_t)
 
-            with numpyro.handlers.mask(mask=mask):
-                numpyro.sample('obs', dist.Normal(flux[:, ...], obs[2, ...]), obs=obs[1, ...])
+            with numpyro.handlers.mask(mask=data['mask']):
+                numpyro.sample('obs', dist.Normal(flux, data['fluxerr']), obs=data['flux'])
 
     # --- Data loading ---
 
-    # Column name patterns for auto-detection (case-insensitive)
-    _COL_PATTERNS = {
-        'time':    ['mjd', 'time', 'jd'],
-        'band':    ['filter', 'band', 'flt'],
-        'image':   ['image', 'img'],
-        'mag':     ['mag', 'magnitude'],
-        'magerr':  ['magerr', 'mag_err'],
-        'flux':    ['flux', 'fluxcal'],
-        'fluxerr': ['fluxerr', 'fluxcalerr', 'flux_err'],
-    }
-    _DEFAULT_COLS = ['mjd', 'filter', 'mag', 'magerr', 'image']
-
-    @staticmethod
-    def _detect_column(df_columns, role, patterns, explicit=None):
-        """Return the column name for a given role, or None if not found."""
-        if explicit is not None:
-            return explicit
-        lower_map = {c.lower(): c for c in df_columns}
-        for pat in patterns:
-            if pat in lower_map:
-                return lower_map[pat]
-        return None
-
-    def process_dataset(self, photometry,
-                       image_col=None, time_col=None, band_col=None,
-                       flux_col=None, fluxerr_col=None,
-                       mag_col=None, magerr_col=None,
-                       peak_mjds=None, z=None, ebv_mw=None,
-                       band_map=None, error_floor=None, sigma_psf=0,
-                       time_format='mjd',
-                       z_err=5e-4):
+    def process_dataset(self, photometry, *, metadata=None, z=None, ebv_mw=None, peak_mjds=None, filt_map=None,
+                        drop_bands=None, error_floor=None, sigma_psf=0, **read_kwargs):
         """
-        Load lensed SN photometry into the format expected by bayesn-td fitting.
+        Load one or more lensed SNe for fitting. Each SEDmodel holds one dataset: create a new SEDmodel for each
+        dataset you load.
 
-        Column names are auto-detected from the file header when not given
-        explicitly. If the file has no header, columns are assumed to be in the
-        order: mjd, filter, mag, magerr, image.
+        Per-SN values (``z``, ``ebv_mw``, ``peak_mjds``) are taken from, in order of precedence: the arguments here
+        (applied to every SN), the ``metadata`` table, then the photometry source itself. Observations with
+        non-finite photometry, in ``drop_bands``, outside the model's phase range or in bands outside the model's
+        wavelength coverage at each SN's redshift are left out, and SNe with an image left with no observations are
+        dropped.
+
+        The prepared data are stored in:
+
+        - ``self.data``: a dictionary keyed by number of images, e.g. ``self.data[2]`` for all doubles. Each entry is
+          a dictionary of padded arrays (keys ``OBS_KEYS``) plus ``band_weights`` and ``sn_index``, the rows of
+          ``self.sn_list`` it holds.
+        - ``self.sn_list``: one row per SN to be fitted, in the order of the SN axis of the fit output: ``SNID``,
+          ``n_images``, ``z``, ``z_cmb``, ``ebv_mw``, ``muhat``, ``image_<i>``, ``peak_mjd_<i>`` and any extra
+          ``metadata`` columns.
+        - ``self.dropped``: SNe that were dropped, with the reason.
+        - ``self.used_band_inds``: indices into the model's band table of the bands in use, which the ``band``
+          arrays index.
+        - ``self.used_band_dict``: the position in ``self.used_band_inds`` of each band in use, keyed by its index
+          in the model's band table.
+        - ``self.zps``, ``self.offsets``: reduced to the bands in use, as in BayeSN.
 
         Parameters
         ----------
-        photometry : str or pd.DataFrame
-            Path to a photometry file (CSV, whitespace-delimited, or ECSV) or
-            a DataFrame.
-        image_col : str, optional
-            Column name for the lensed image identifier. Auto-detected if not
-            given.
-        time_col : str, optional
-            Column name for observation times. Auto-detected if not given.
-        band_col : str, optional
-            Column name for the filter/band. Auto-detected if not given.
-        flux_col : str, optional
-            Column name for flux values (FLUXCAL system, zeropoint 27.5).
-            Auto-detected if not given.
-        fluxerr_col : str, optional
-            Column name for flux errors. Auto-detected if not given.
-        mag_col : str, optional
-            Column name for magnitudes. Auto-detected if not given.
-        magerr_col : str, optional
-            Column name for magnitude errors. Auto-detected if not given.
-        peak_mjds : list of float, optional
-            Estimated peak MJD for each image. The ordering matches
-            ``sorted(df[image_col].unique())``. If not given, read from ECSV
-            metadata.
+        photometry : str, pd.DataFrame or list
+            Anything accepted by ``bayesn_td.io.read_photometry``: a file, a directory, a glob pattern, a DataFrame,
+            or a list of these.
+        metadata : str or pd.DataFrame, optional
+            Table keyed by an ``SNID`` column, with any of the columns ``z``, ``z_cmb``, ``ebv_mw`` and
+            ``peak_mjd_<image label>``. Other columns (e.g. true values) are carried through to the output.
         z : float, optional
-            Source redshift. If not given, read from ECSV metadata.
+            Source redshift, applied to every SN.
         ebv_mw : float, optional
-            Milky Way E(B-V). If not given, read from ECSV metadata.
-        band_map : dict, optional
-            Mapping from column band names to BayeSN band names.
+            Milky Way E(B-V), applied to every SN.
+        peak_mjds : list of float, optional
+            Estimated observer-frame peak of each image, ordered by sorted image label, applied to every SN (all must
+            have this many images). For ``time_format='phase'`` data, the peaks only place the fitted peaks and time
+            delays on the observer clock, and default to 0.
+        filt_map : dict, optional
+            Mapping from band names in the data to BayeSN filter names (``map`` in a YAML input file). Bands not in
+            the filter set after mapping raise an error.
+        drop_bands : list of str, optional
+            Bands to leave out, named as in the data.
         error_floor : dict, optional
-            Per-band error floor in magnitudes, e.g. ``{'F090W': 0.02}``.
+            Per-band error floor in magnitudes, keyed by BayeSN filter name (after ``filt_map``), added in quadrature.
+            Magnitude photometry only.
         sigma_psf : float, optional
-            PSF uncertainty to add in quadrature to mag errors. Default 0.
-        time_format : str, optional
-            ``'mjd'`` (default) or ``'phase'``.
-        z_err : float, optional
-            Redshift error. Default 5e-4.
+            PSF uncertainty in magnitudes, added in quadrature. Magnitude photometry only. Default 0.
+        **read_kwargs
+            Passed to ``bayesn_td.io.read_photometry`` (e.g. ``format``, ``time_format``, column names,
+            ``true_values``).
         """
-        self.zps = self._full_zps
-        self.offsets = self._full_offsets
+        if self.data is not None:
+            raise ValueError('This SEDmodel already holds a dataset; create a new SEDmodel for each dataset')
+        sne = read_photometry(photometry, **read_kwargs)
+        counts = pd.Series([sn['name'] for sn in sne]).value_counts()
+        if (counts > 1).any():
+            raise ValueError(f'SN names must be unique; duplicated: {list(counts.index[counts > 1])}')
 
-        if band_map is None:
-            band_map = {}
+        metadata = self._read_metadata(metadata)
+        if metadata is not None and not metadata.index.isin([sn['name'] for sn in sne]).any():
+            raise ValueError(f'No SN names match the metadata SNID column (e.g. {metadata.index[0]!r} vs '
+                             f'{sne[0]["name"]!r})')
+        values_for_all_sne = {'z': z, 'ebv_mw': ebv_mw, 'peak_mjds': peak_mjds}
 
-        # --- Read file ---
-        if isinstance(photometry, str):
-            if photometry.endswith('.csv'):
-                df = pd.read_csv(photometry)
-            else:
-                df = pd.read_csv(photometry, sep=r'\s+', comment='#')
-            file_meta = self._read_ecsv_metadata(photometry)
-        else:
-            df = photometry.copy()
-            file_meta = None
+        rows, curves, dropped, n_nonfinite = [], [], [], []
+        for sn in sne:
+            info = self._resolve_metadata(sn, metadata, values_for_all_sne)
+            lc, reason, n_removed = self._prepare_sn(sn, info, filt_map or {}, set(drop_bands or ()),
+                                                     error_floor or {}, sigma_psf)
+            if n_removed:
+                n_nonfinite.append(n_removed)
+            if reason is not None:
+                dropped.append((sn['name'], reason))
+                continue
+            rows.append(info)
+            curves.append(lc)
+        if n_nonfinite:
+            print(f'process_dataset: removed {sum(n_nonfinite)} observations with non-finite photometry from '
+                  f'{len(n_nonfinite)} SNe')
+        if dropped:
+            print(f'process_dataset: dropped {len(dropped)} of {len(sne)} SNe; see self.dropped')
+        if not rows:
+            raise ValueError('No SNe left to fit')
 
-        # --- Handle headerless files ---
-        if all(isinstance(c, int) for c in df.columns):
-            print(f'process_dataset: no header detected. '
-                  f'Assuming column order: {self._DEFAULT_COLS}')
-            df.columns = self._DEFAULT_COLS[:len(df.columns)]
-
-        # --- Auto-detect columns ---
-        cols = df.columns
-        time_col = self._detect_column(cols, 'time', self._COL_PATTERNS['time'], time_col)
-        band_col = self._detect_column(cols, 'band', self._COL_PATTERNS['band'], band_col)
-        image_col = self._detect_column(cols, 'image', self._COL_PATTERNS['image'], image_col)
-        mag_col = self._detect_column(cols, 'mag', self._COL_PATTERNS['mag'], mag_col)
-        magerr_col = self._detect_column(cols, 'magerr', self._COL_PATTERNS['magerr'], magerr_col)
-        flux_col = self._detect_column(cols, 'flux', self._COL_PATTERNS['flux'], flux_col)
-        fluxerr_col = self._detect_column(cols, 'fluxerr', self._COL_PATTERNS['fluxerr'], fluxerr_col)
-
-        for role, val in [('time', time_col), ('band', band_col), ('image', image_col)]:
-            if val is None:
-                raise ValueError(
-                    f'Could not detect {role} column. Available columns: '
-                    f'{list(cols)}. Pass {role}_col explicitly.')
-        has_mag = mag_col is not None and magerr_col is not None
-        has_flux = flux_col is not None and fluxerr_col is not None
-        if not has_mag and not has_flux:
-            raise ValueError(
-                'Could not detect photometry columns. Need either '
-                'mag+magerr or flux+fluxerr columns. Available columns: '
-                f'{list(cols)}.')
-
-        # --- Image labels from sorted unique values ---
-        image_labels = sorted(df[image_col].unique())
-
-        # --- Fall back to ECSV metadata ---
-        if file_meta is not None:
-            loaded = []
-            if peak_mjds is None and 'peak_mjds' in file_meta:
-                peak_mjds = list(file_meta['peak_mjds'])
-                loaded.append(f'peak_mjds={peak_mjds}')
-            if z is None and 'z' in file_meta:
-                z = float(file_meta['z'])
-                loaded.append(f'z={z}')
-            if ebv_mw is None and 'ebv_mw' in file_meta:
-                ebv_mw = float(file_meta['ebv_mw'])
-                loaded.append(f'ebv_mw={ebv_mw}')
-            if loaded:
-                print('process_dataset: loaded from ECSV metadata: '
-                      + ', '.join(loaded))
-
-        missing = [name for name, val in [
-            ('peak_mjds', peak_mjds), ('z', z), ('ebv_mw', ebv_mw),
-        ] if val is None]
-        if missing:
-            raise ValueError(
-                f'process_dataset: required arguments not given and not found '
-                f'in file metadata: {missing}'
-            )
-        if len(peak_mjds) != len(image_labels):
-            raise ValueError(
-                f'peak_mjds has length {len(peak_mjds)} but image_col has '
-                f'{len(image_labels)} unique values: {image_labels}'
-            )
-
-        num_images = len(image_labels)
-        peak_mjds = np.array(peak_mjds)
-
-        used_bands = ['NULL_BAND']
-        used_band_dict = {0: 0}
-        lcs = []
-        lens = []
-
-        for i, img_label in enumerate(image_labels):
-            img_data = df[df[image_col] == img_label].copy()
-
-            # Apply band mapping
-            for f in img_data[band_col].unique():
-                if f not in band_map:
-                    band_map[f] = f
-            img_data[band_col] = img_data[band_col].apply(lambda x: band_map[x])
-
-            # Convert times to rest-frame phase
-            if time_format == 'mjd':
-                img_data['time'] = (img_data[time_col] - peak_mjds[i]) / (1 + z)
-            else:
-                img_data['time'] = img_data[time_col]
-
-            # Remove bands outside model wavelength coverage
-            bands_to_remove = []
-            for f in img_data[band_col].unique():
-                if f not in self.band_lim_dict:
-                    bands_to_remove.append(f)
-                    continue
-                if z > (self.band_lim_dict[f][0] / self.l_knots[0] - 1) or \
-                   z < (self.band_lim_dict[f][1] / self.l_knots[-1] - 1):
-                    bands_to_remove.append(f)
-            if bands_to_remove:
-                img_data = img_data[~img_data[band_col].isin(bands_to_remove)]
-
-            # Register used bands
-            for f in img_data[band_col].unique():
-                if f not in used_bands:
-                    used_bands.append(f)
-                    if f not in self.band_dict:
-                        raise KeyError(f'Filter {f} not present in BayeSN, check your filter mapping')
-                    used_band_dict[self.band_dict[f]] = len(used_bands) - 1
-
-            img_data['band_indices'] = img_data[band_col].apply(lambda x: used_band_dict[self.band_dict[x]])
-
-            # Compute flux from magnitudes if needed
-            if mag_col is not None and magerr_col is not None:
-                mag_err = img_data[magerr_col].values.copy()
-                if error_floor is not None:
-                    floor = np.array([error_floor.get(b, 0) for b in img_data[band_col]])
-                    mag_err = np.sqrt(mag_err ** 2 + floor ** 2 + sigma_psf ** 2)
-                img_data['FLUXCAL'] = np.power(10, (27.5 - img_data[mag_col]) / 2.5)
-                img_data['FLUXCALERR'] = (2.5 / np.log(10)) * mag_err * img_data['FLUXCAL']
-            else:
-                img_data['FLUXCAL'] = img_data[flux_col]
-                img_data['FLUXCALERR'] = img_data[fluxerr_col]
-
-            img_data['redshift'] = z
-            img_data['redshift_error'] = z_err
-            img_data['dist_mod'] = self.cosmo.distmod(z).value
-            img_data['MWEBV'] = ebv_mw
-            img_data['mask'] = 1
-
-            lc = img_data[['time', 'FLUXCAL', 'FLUXCALERR', 'band_indices',
-                            'redshift', 'redshift_error', 'dist_mod', 'MWEBV', 'mask']]
-            lcs.append(lc)
-            lens.append(lc.shape[0])
-
-        max_sn_len = np.max(lens)
-        all_data = np.zeros((9, max_sn_len, num_images, 1))
-        for i in range(num_images):
-            all_data[:, :lcs[i].shape[0], i, 0] = lcs[i].values.T
-            all_data[2, lcs[i].shape[0]:, i, 0] = 1 / jnp.sqrt(2 * np.pi)
-
-        self.data = device_put(all_data)
-        self.used_band_inds = jnp.array([self.band_dict[f] for f in used_bands])
+        self.sn_list = pd.DataFrame(rows)
+        self.dropped = pd.DataFrame(dropped, columns=['SNID', 'reason'])
+        bands = sorted({b for lc in curves for b in lc['band']}, key=self.band_dict.get)
+        self.used_band_inds = np.array([self.band_dict['NULL_BAND']] + [self.band_dict[b] for b in bands])
+        self.used_band_dict = {int(band_ind): i for i, band_ind in enumerate(self.used_band_inds)}
         self.zps = self.zps[self.used_band_inds]
         self.offsets = self.offsets[self.used_band_inds]
-        self.band_weights = self._calculate_band_weights(
-            self.data[-5, 0, 0, :], self.data[-2, 0, 0, :])
-        self.peak_mjds = peak_mjds[:, None]
-        self.zs = np.array([z])
-        self.deltas = None
-        self.sn_list = ['SN']
+        self.data = self._pad_by_image_count(curves)
 
-    # --- YAML-driven entry points ---
+    @staticmethod
+    def _read_metadata(metadata):
+        """Load a per-SN metadata table, indexed by SNID."""
+        if metadata is None:
+            return None
+        if isinstance(metadata, pd.DataFrame):
+            table = metadata.copy()
+        else:
+            table = read_text_table(metadata, dtype={'SNID': str})[0]
+        if 'SNID' not in table.columns:
+            raise ValueError(f'metadata table needs an SNID column; has {list(table.columns)}')
+        table['SNID'] = table['SNID'].astype(str)
+        if table['SNID'].duplicated().any():
+            raise ValueError('metadata table has duplicate SNID entries')
+        clashing_columns = [c for c in table.columns if c in ('n_images', 'muhat') or re.fullmatch(r'image_\d+', c)]
+        if clashing_columns:
+            raise ValueError(f'metadata columns {clashing_columns} clash with values computed by process_dataset; '
+                             f'rename them')
+        return table.set_index('SNID')
 
-    def parse_yaml_input(self, args, cmd_args):
+    def _resolve_metadata(self, sn, metadata, values_for_all_sne):
         """
-        Parse a YAML input file and command-line overrides, then load data.
+        Resolve the per-SN values used for fitting: process_dataset argument, then metadata table, then the
+        photometry source itself.
+        """
+        name = sn['name']
+        labels = sorted(set(sn['phot']['image']) | set(sn['peak_mjds'] or {}))
+        row = metadata.loc[name] if metadata is not None and name in metadata.index else None
 
-        Parameters
-        ----------
-        args : dict
-            Dictionary of arguments from YAML input file.
-        cmd_args : argparse.Namespace
-            Command-line arguments that override YAML values.
+        def pick(key):
+            """Return the value for key and its source: 0 argument, 1 metadata table, 2 photometry source."""
+            if values_for_all_sne.get(key) is not None:
+                return values_for_all_sne[key], 0
+            if row is not None and key in row.index and pd.notna(row[key]):
+                return row[key], 1
+            return sn[key], 2
+
+        (z, z_source), (z_cmb, z_cmb_source), (ebv_mw, _) = pick('z'), pick('z_cmb'), pick('ebv_mw')
+        if z_cmb_source > z_source:  # a CMB-frame redshift from a less authoritative source than z is not used
+            z_cmb = None
+
+        if values_for_all_sne['peak_mjds'] is not None:
+            if len(values_for_all_sne['peak_mjds']) != len(labels):
+                raise ValueError(f'{name}: peak_mjds has {len(values_for_all_sne["peak_mjds"])} entries but the SN '
+                                 f'has images {labels}')
+            peaks = dict(zip(labels, values_for_all_sne['peak_mjds']))
+        elif row is not None and all(pd.notna(row.get(f'peak_mjd_{label}')) for label in labels):
+            peaks = {label: row[f'peak_mjd_{label}'] for label in labels}
+        elif sn['peak_mjds'] is not None:
+            peaks = sn['peak_mjds']
+        elif sn['time_format'] == 'phase':  # without peaks, fitted peaks are relative to each image's phase zero
+            peaks = {label: 0.0 for label in labels}
+        else:
+            peaks = None
+
+        missing = [key for key, val in [('z', z), ('ebv_mw', ebv_mw), ('peak_mjds', peaks)] if val is None]
+        if peaks is not None and not set(labels) <= set(peaks):
+            missing.append(f'peak_mjds for images {sorted(set(labels) - set(peaks))}')
+        if missing:
+            raise ValueError(f'{name}: no value found for {missing}. Pass them as arguments, in a metadata table, or '
+                             f'in the photometry file header.')
+
+        info = {'SNID': name, 'n_images': len(labels), 'z': float(z),
+                'z_cmb': np.nan if z_cmb is None else float(z_cmb), 'ebv_mw': float(ebv_mw),
+                'muhat': float(self.cosmo.distmod(z_cmb if z_cmb is not None else z).value)}
+        for i, label in enumerate(labels):
+            info[f'image_{i}'] = label
+            info[f'peak_mjd_{i}'] = float(peaks[label])
+        if row is not None:
+            info.update({key: val for key, val in row.items()
+                         if key not in ('z', 'z_cmb', 'ebv_mw') and not key.startswith('peak_mjd_')})
+        return info
+
+    def _prepare_sn(self, sn, info, filt_map, drop_bands, error_floor, sigma_psf):
+        """
+        Remove observations with non-finite photometry or in dropped bands, map bands, compute rest-frame phases,
+        remove observations outside the model's phase range and bands outside its wavelength coverage for one SN,
+        then convert its photometry to flux.
 
         Returns
         -------
-        args : dict
-            Merged configuration dictionary.
+        lc : pd.DataFrame or None
+            Columns ``image``, ``phase``, ``band``, ``flux``, ``fluxerr``.
+        reason : str or None
+            Why the SN was dropped, or None if it is kept.
+        n_removed : int
+            Number of observations removed for non-finite photometry.
         """
-        for arg in vars(cmd_args):
-            if arg in ['input', 'filters']:
-                continue
-            arg_val = getattr(cmd_args, arg)
-            if arg_val is not None:
-                args[arg] = arg_val
+        labels = [info[f'image_{i}'] for i in range(info['n_images'])]
+        if not labels:
+            return None, 'no images', 0
+        peaks = {label: info[f'peak_mjd_{i}'] for i, label in enumerate(labels)}
+        z = info['z']
 
-        args.setdefault('num_chains', 4)
-        args.setdefault('num_warmup', 500)
-        args.setdefault('num_samples', 500)
-        args.setdefault('chain_method', 'parallel')
-        args.setdefault('init_strategy', 'median')
-        args.setdefault('include_eps', True)
-        args.setdefault('include_ml', True)
-        args.setdefault('outputdir', os.path.join(os.getcwd(), 'results'))
+        phot = sn['phot']
+        photometry = ['mag', 'magerr'] if 'mag' in phot.columns else ['flux', 'fluxerr']
+        finite = np.isfinite(phot[photometry]).all(axis=1)
+        n_removed = int((~finite).sum())
+        lc = phot[finite & ~phot['band'].isin(drop_bands)].copy()
+        lc['band'] = lc['band'].map(lambda b: filt_map.get(b, b))
+        unknown = sorted(set(lc['band']) - set(self.band_dict))
+        if unknown:
+            raise KeyError(f'{sn["name"]}: bands {unknown} are not in the filter set; map them with filt_map or '
+                           f'leave them out with drop_bands')
 
-        if not os.path.exists(args['outputdir']):
-            os.makedirs(args['outputdir'])
+        if sn['time_format'] == 'mjd':
+            lc['phase'] = (lc['time'] - lc['image'].map(peaks)) / (1 + z)
+        elif sn['time_format'] == 'phase':
+            lc['phase'] = lc['time']
+        else:
+            raise ValueError(f"{sn['name']}: time_format must be 'mjd' or 'phase', got {sn['time_format']!r}")
+        lc = lc[(lc['phase'] > self.tau_knots[0]) & (lc['phase'] < self.tau_knots[-1])]
 
-        data = args['data']
-        self.process_dataset(
-            photometry=data['photometry'],
-            image_col=data.get('image_col'),
-            time_col=data.get('time_col'),
-            band_col=data.get('band_col'),
-            flux_col=data.get('flux_col'),
-            fluxerr_col=data.get('fluxerr_col'),
-            mag_col=data.get('mag_col'),
-            magerr_col=data.get('magerr_col'),
-            peak_mjds=data.get('peak_mjds'),
-            z=data.get('z'),
-            ebv_mw=data.get('ebv_mw'),
-            band_map=data.get('band_map'),
-            error_floor=data.get('error_floor'),
-            time_format=data.get('time_format', 'mjd'),
-        )
-        if 'true_delta_t' in data:
-            self.deltas = np.array(data['true_delta_t'])
-        if 'sn_name' in data:
-            self.sn_list = [data['sn_name']]
-        return args
+        low, high = self.l_knots[0], self.l_knots[-1]
+        covered = [b for b in lc['band'].unique()
+                   if self.band_lim_dict[b][0] / low - 1 >= z >= self.band_lim_dict[b][1] / high - 1]
+        lc = lc[lc['band'].isin(covered)]
+        empty = [label for label in labels if not (lc['image'] == label).any()]
+        if empty:
+            return None, f'no usable observations in images {empty}', n_removed
 
-    def run(self, args, cmd_args):
+        if 'mag' in lc.columns:
+            floor = lc['band'].map(lambda b: error_floor.get(b, 0))
+            magerr = np.sqrt(lc['magerr'] ** 2 + floor ** 2 + sigma_psf ** 2)
+            lc['flux'] = np.power(10, (ZPT - lc['mag']) / 2.5)
+            lc['fluxerr'] = (np.log(10) / 2.5) * magerr * lc['flux']
+        elif error_floor or sigma_psf:
+            raise ValueError('error_floor and sigma_psf are magnitude errors and cannot be applied to flux '
+                             'photometry')
+        return lc[['image', 'phase', 'band', 'flux', 'fluxerr']], None, n_removed
+
+    def _pad_by_image_count(self, curves):
         """
-        Main method to run bayesn-td from a YAML configuration.
+        Pad the prepared light curves into arrays, one set per number of images.
 
         Parameters
         ----------
-        args : dict
-            Dictionary of arguments from YAML input file.
-        cmd_args : argparse.Namespace
-            Command-line arguments that override YAML values.
-        """
-        args = self.parse_yaml_input(args, cmd_args)
+        curves : list of pd.DataFrame
+            Prepared light curves, in the order of ``self.sn_list``.
 
-        print('Running bayesn-td fitting...')
-        samples = self.fit(
-            num_samples=args['num_samples'],
-            num_warmup=args['num_warmup'],
-            num_chains=args['num_chains'],
-            output=args['outputdir'],
-            chain_method=args['chain_method'],
-            init_strategy=args['init_strategy'],
-            include_eps=args['include_eps'],
-            include_ml=args['include_ml'],
-        )
-        print('Done.')
-        return samples
+        Returns
+        -------
+        data : dict
+            Keyed by number of images; see ``process_dataset``.
+        """
+        table = self.sn_list
+        data = {}
+        for n_img in sorted(table['n_images'].unique()):
+            sn_index = np.flatnonzero(table['n_images'].values == n_img)
+            n_sn = len(sn_index)
+            n_obs = max(curves[i]['image'].value_counts().max() for i in sn_index)
+            phase = np.zeros((n_obs, n_img, n_sn))
+            flux = np.zeros((n_obs, n_img, n_sn))
+            fluxerr = np.full((n_obs, n_img, n_sn), PAD_FLUXERR)
+            band = np.zeros((n_obs, n_img, n_sn), dtype=int)
+            mask = np.zeros((n_obs, n_img, n_sn), dtype=bool)
+            for j, i in enumerate(sn_index):
+                for k in range(n_img):
+                    img = curves[i][curves[i]['image'] == table.at[i, f'image_{k}']]
+                    n = len(img)
+                    phase[:n, k, j] = img['phase']
+                    flux[:n, k, j] = img['flux']
+                    fluxerr[:n, k, j] = img['fluxerr']
+                    band[:n, k, j] = img['band'].map(self.band_dict).map(self.used_band_dict)
+                    mask[:n, k, j] = True
+            muhat = np.tile(table['muhat'].values[sn_index], (n_img, 1))
+            arrays = dict(zip(OBS_KEYS, (phase, flux, fluxerr, band, mask, muhat)))
+            data[n_img] = {key: device_put(jnp.asarray(val)) for key, val in arrays.items()}
+            data[n_img]['band_weights'] = self._calculate_band_weights(table['z'].values[sn_index],
+                                                                       table['ebv_mw'].values[sn_index])
+            data[n_img]['sn_index'] = sn_index
+        return data
 
     # --- Fitting ---
 
-    def fit(self, num_samples, num_warmup, num_chains, output,
-            chain_method='parallel', init_strategy='median',
-            include_eps=True, include_ml=True):
+    def fit(self, num_samples=500, num_warmup=500, num_chains=4, outputdir='results', chain_method='parallel',
+            init_strategy='median', include_eps=True, include_ml=True):
         """
         Run MCMC fitting for lensed SN time delays.
 
-        Data must be loaded first via process_dataset.
+        Data must be loaded first via ``process_dataset``. Each SN is fitted independently; SNe with the same number
+        of images are fitted together in one vectorised run.
 
         Parameters
         ----------
-        num_samples : int
-            Number of posterior samples per chain.
-        num_warmup : int
-            Number of warmup steps.
-        num_chains : int
-            Number of chains.
-        output : str
-            Output directory path for results.
-        chain_method : str, optional
-            'parallel', 'sequential', or 'vectorized'. Default 'parallel'.
-        init_strategy : str, optional
-            'median' or 'sample'. Default 'median'.
-        include_eps : bool, optional
-            Include epsilon in model. Default True.
-        include_ml : bool, optional
-            Include microlensing GP in model. Default True.
-
-        Returns
-        -------
-        samples : dict
-            Processed MCMC samples including time delays.
-        """
-        if init_strategy == 'median':
-            init_strat = init_to_median()
-        elif init_strategy == 'sample':
-            init_strat = init_to_sample()
-        else:
-            raise ValueError('Invalid init strategy, must be one of median or sample')
-
-        def numpyro_model(obs, weights):
-            self.td_model(obs, weights, include_eps=include_eps, include_ml=include_ml)
-
-        def do_mcmc(data, weights):
-            rng = PRNGKey(123)
-            rng, rng_ = split(rng)
-            nuts_kernel = NUTS(numpyro_model, adapt_step_size=True,
-                               init_strategy=init_strat, max_tree_depth=10)
-            mcmc = MCMC(nuts_kernel, num_samples=num_samples, num_warmup=num_warmup,
-                        num_chains=num_chains, chain_method=chain_method, progress_bar=False)
-            mcmc.run(rng, data[..., None], weights[None, ...], extra_fields=['diverging'])
-            return {**mcmc.get_samples(group_by_chain=True), **mcmc.get_extra_fields(group_by_chain=True)}
-
-        start = timeit.default_timer()
-
-        mcmc_map = jax.vmap(do_mcmc, in_axes=(3, 0))
-        params = mcmc_map(self.data, self.band_weights)
-        extras = {'diverging': params['diverging']}
-        samples = {k: v for k, v in params.items() if k != 'diverging'}
-
-        end = timeit.default_timer()
-        print(f'Inference time: {end - start:.2f} seconds')
-
-        samples = self.fit_postprocess(samples, extras, output)
-        return samples
-
-    def fit_lensed_sn(self, photometry,
-                      image_col=None, time_col=None, band_col=None,
-                      flux_col=None, fluxerr_col=None,
-                      mag_col=None, magerr_col=None,
-                      peak_mjds=None, z=None, ebv_mw=None,
-                      band_map=None, error_floor=None, sigma_psf=0,
-                      time_format='mjd',
-                      num_samples=500, num_warmup=500, num_chains=4,
-                      chain_method='parallel', init_strategy='median',
-                      include_eps=True, include_ml=True,
-                      output=None):
-        """
-        Load data and fit a single lensed SN.
-
-        Calls ``process_dataset`` then ``fit``. Column names are auto-detected
-        from the file header when not given explicitly.
-
-        Parameters
-        ----------
-        photometry : str or pd.DataFrame
-            Path to photometry file or a DataFrame.
-        image_col, time_col, band_col : str, optional
-            Column names. Auto-detected if not given.
-        flux_col, fluxerr_col : str, optional
-            Flux column names (FLUXCAL system). Auto-detected if not given.
-        mag_col, magerr_col : str, optional
-            Magnitude column names. Auto-detected if not given.
-        peak_mjds : list of float, optional
-            Estimated peak MJD for each image. If not given, read from ECSV
-            metadata.
-        z : float, optional
-            Source redshift. If not given, read from ECSV metadata.
-        ebv_mw : float, optional
-            Milky Way E(B-V). If not given, read from ECSV metadata.
-        band_map : dict, optional
-            Mapping from data band names to BayeSN band names.
-        error_floor : dict, optional
-            Per-band error floor in magnitudes.
-        sigma_psf : float, optional
-            PSF uncertainty to add in quadrature. Default 0.
-        time_format : str, optional
-            'mjd' or 'phase'. Default 'mjd'.
         num_samples : int, optional
             Number of posterior samples per chain. Default 500.
         num_warmup : int, optional
             Number of warmup steps. Default 500.
         num_chains : int, optional
             Number of chains. Default 4.
+        outputdir : str, optional
+            Output directory path for results. Default 'results'.
         chain_method : str, optional
             'parallel', 'sequential', or 'vectorized'. Default 'parallel'.
         init_strategy : str, optional
@@ -1059,41 +918,134 @@ class SEDmodel:
             Include epsilon in model. Default True.
         include_ml : bool, optional
             Include microlensing GP in model. Default True.
-        output : str, optional
-            Output directory. Default creates 'results/fit'.
+
+        Returns
+        -------
+        samples : dict
+            Processed MCMC samples including time delays, with SNe on the last axis in the order of
+            ``self.sn_list``.
+        """
+        if self.data is None:
+            raise ValueError('No data loaded; call process_dataset first')
+        init_strategies = {'median': init_to_median, 'sample': init_to_sample}
+        if init_strategy not in init_strategies:
+            raise ValueError(f'Invalid init strategy {init_strategy!r}, must be one of {list(init_strategies)}')
+
+        def numpyro_model(data, weights):
+            self.td_model(data, weights, include_eps=include_eps, include_ml=include_ml)
+
+        def do_mcmc(data, weights):
+            nuts_kernel = NUTS(numpyro_model, adapt_step_size=True,
+                               init_strategy=init_strategies[init_strategy](), max_tree_depth=10)
+            mcmc = MCMC(nuts_kernel, num_samples=num_samples, num_warmup=num_warmup,
+                        num_chains=num_chains, chain_method=chain_method, progress_bar=False)
+            data = jax.tree_util.tree_map(lambda x: x[..., None], data)
+            mcmc.run(PRNGKey(SEED), data, weights[None, ...], extra_fields=['diverging'])
+            return mcmc.get_samples(group_by_chain=True), mcmc.get_extra_fields(group_by_chain=True)
+
+        start = timeit.default_timer()
+        samples_by_n_img, extras_by_n_img = {}, {}
+        for n_img, data in self.data.items():
+            obs = {key: data[key] for key in OBS_KEYS}
+            sn_axes = self._sn_axes(numpyro_model, obs, data['band_weights'])
+            samples, extras = jax.vmap(do_mcmc, in_axes=(-1, 0))(obs, data['band_weights'])
+            samples_by_n_img[n_img] = {key: self._sn_last(val, sn_axes[key]) for key, val in samples.items()}
+            extras_by_n_img[n_img] = {key: self._sn_last(val, None) for key, val in extras.items()}
+        end = timeit.default_timer()
+        print(f'Inference time: {end - start:.2f} seconds')
+
+        return self.fit_postprocess(self._merge_image_counts(samples_by_n_img),
+                                    self._merge_image_counts(extras_by_n_img), outputdir)
+
+    @staticmethod
+    def _sn_axes(model, obs, band_weights):
+        """
+        Find the axis of the SN plate in every sample and deterministic site of ``model``, by tracing it with one SN
+        and with two: the SN axis is the one axis whose size changes.
+        """
+        one = {key: val[..., :1] for key, val in obs.items()}
+        two = {key: jnp.concatenate([val, val], axis=-1) for key, val in one.items()}
+        weights = band_weights[:1]
+        shapes = []
+        for data, w in [(one, weights), (two, jnp.concatenate([weights, weights]))]:
+            model_trace = numpyro.handlers.trace(numpyro.handlers.seed(model, 0)).get_trace(data, w)
+            shapes.append({name: jnp.shape(site['value']) for name, site in model_trace.items()
+                           if site['type'] in ('sample', 'deterministic') and not site.get('is_observed')})
+        axes = {}
+        for name, shape in shapes[0].items():
+            changed = [i for i, (a, b) in enumerate(zip(shape, shapes[1][name])) if a != b]
+            if len(changed) != 1:
+                raise RuntimeError(f'Cannot locate the SN axis of site {name!r}: shapes {shape} and '
+                                   f'{shapes[1][name]}')
+            axes[name] = changed[0]
+        return axes
+
+    @staticmethod
+    def _sn_last(values, sn_axis):
+        """
+        Convert a vmapped MCMC output of shape ``(n_sn, chains, samples, *site)`` to
+        ``(chains, samples, *site without the SN plate axis, n_sn)``. Extra fields such as ``diverging`` have no
+        plate axis (``sn_axis=None``).
+        """
+        values = np.asarray(values)
+        if sn_axis is not None:
+            values = np.take(values, 0, axis=3 + sn_axis)
+        return np.moveaxis(values, 0, -1)
+
+    def _merge_image_counts(self, samples_by_n_img):
+        """
+        Merge samples fitted separately for each number of images into arrays covering every SN, in the order of
+        ``self.sn_list``. Axes that differ in size between image counts (e.g. the number of images) are padded with
+        NaN, or False for booleans.
+        """
+        n_sn = len(self.sn_list)
+        merged = {}
+        for key in next(iter(samples_by_n_img.values())):
+            parts = [(self.data[n_img]['sn_index'], samples[key]) for n_img, samples in samples_by_n_img.items()]
+            shape = np.max([part.shape[:-1] for _, part in parts], axis=0)
+            dtype = parts[0][1].dtype
+            out = np.full((*shape, n_sn), False if dtype == bool else np.nan, dtype=dtype)
+            for sn_index, part in parts:
+                out[tuple(slice(0, n) for n in part.shape[:-1]) + (sn_index,)] = part
+            merged[key] = out
+        return merged
+
+    def fit_lensed_sn(self, photometry, **kwargs):
+        """
+        Load data and fit one or more lensed SNe.
+
+        Keyword arguments accepted by ``fit`` (``num_samples``, ``num_warmup``, ``num_chains``, ``outputdir``,
+        ``chain_method``, ``init_strategy``, ``include_eps``, ``include_ml``) are passed to it; all others are passed
+        to ``process_dataset``.
+
+        Parameters
+        ----------
+        photometry : str, pd.DataFrame or list
+            See ``process_dataset``.
+        **kwargs
+            Arguments for ``fit`` and ``process_dataset``.
 
         Returns
         -------
         samples : dict
             Processed MCMC samples including time delays.
         """
-        self.process_dataset(
-            photometry,
-            image_col=image_col, time_col=time_col, band_col=band_col,
-            flux_col=flux_col, fluxerr_col=fluxerr_col,
-            mag_col=mag_col, magerr_col=magerr_col,
-            peak_mjds=peak_mjds, z=z, ebv_mw=ebv_mw,
-            band_map=band_map, error_floor=error_floor, sigma_psf=sigma_psf,
-            time_format=time_format)
+        fit_params = inspect.signature(self.fit).parameters
+        fit_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in fit_params}
+        self.process_dataset(photometry, **kwargs)
+        return self.fit(**fit_kwargs)
 
-        if output is None:
-            output = os.path.join(os.getcwd(), 'results', 'fit')
-
-        return self.fit(num_samples, num_warmup, num_chains, output,
-                        chain_method=chain_method, init_strategy=init_strategy,
-                        include_eps=include_eps, include_ml=include_ml)
-
-    def fit_postprocess(self, samples, extras, output):
+    def fit_postprocess(self, samples, extras, outputdir):
         """
         Process MCMC output: compute time delays, save chains and summary statistics.
 
         Parameters
         ----------
         samples : dict
-            MCMC samples.
+            MCMC samples, with SNe on the last axis.
         extras : dict
             Extra MCMC fields (divergences, etc.).
-        output : str
+        outputdir : str
             Output directory path.
 
         Returns
@@ -1101,62 +1053,31 @@ class SEDmodel:
         samples : dict
             Processed samples with time delays and distance moduli added.
         """
-        if not os.path.exists(output):
-            os.makedirs(output)
-
-        N_sn = samples['theta'].shape[0]
-
-        with open(os.path.join(output, 'initial_chains.pkl'), 'wb') as file:
+        os.makedirs(outputdir, exist_ok=True)
+        with open(os.path.join(outputdir, 'initial_chains.pkl'), 'wb') as file:
             pickle.dump({**samples, **extras}, file)
 
-        if len(samples['theta'].shape) > 3:
-            if N_sn == 1:
-                for param, val in samples.items():
-                    samples[param] = val[0, ...]
-            else:
-                for param, val in samples.items():
-                    val = jnp.squeeze(val)
-                    if len(val.shape) == 2:
-                        val = val[None, ...]
-                    if len(val.shape) > 4:
-                        val = val.transpose(1, 2, 3, 0, 4)
-                    elif len(val.shape) > 3:
-                        val = val.transpose(1, 2, 3, 0)
-                    else:
-                        val = val.transpose(1, 2, 0)
-                    samples[param] = val
+        table = self.sn_list
+        n_img = samples['tmax'].shape[-2]
+        peak_guesses = table[[f'peak_mjd_{i}' for i in range(n_img)]].values.T
+        z = table['z'].values
+        muhat = table['muhat'].values
 
-        peak_mjds = self.peak_mjds[None, None, ...] + samples['tmax'] * (1 + self.zs[None, None, None, :])
-        samples['peak_mjd'] = peak_mjds
+        samples['peak_mjd'] = peak_guesses + samples['tmax'] * (1 + z)
+        samples['delta_t'] = samples['peak_mjd'][:, :, :1] - samples['peak_mjd'][:, :, 1:]
 
-        delta_t = np.zeros((peak_mjds.shape[0], peak_mjds.shape[1], peak_mjds.shape[2] - 1, peak_mjds.shape[3]))
-        for img in range(peak_mjds.shape[-2] - 1):
-            delta_t[:, :, img, :] = (peak_mjds[:, :, 0, :] - peak_mjds[:, :, img + 1, :])
-        samples['delta_t'] = delta_t
+        sigma0, width = float(self.sigma0), DS_PRIOR_WIDTH
+        Ds_var = width ** 2 + sigma0 ** 2
+        mu_mean = (samples['Ds'] * width ** 2 + muhat * sigma0 ** 2) / Ds_var
+        mu_sd = np.sqrt(sigma0 ** 2 * width ** 2 / Ds_var)
+        samples['mu'] = np.random.default_rng(SEED).normal(mu_mean, mu_sd)
+        samples['delM'] = samples['Ds'] - samples['mu']
+        samples['delta'] = samples['mu'] - muhat
 
-        muhat = self.data[-3, 0, :]
-        muhat_err = 5
-        Ds_err = jnp.sqrt(muhat_err * muhat_err + self.sigma0 * self.sigma0)
-
-        mu = np.random.normal(
-            (samples['Ds'] * np.power(muhat_err, 2) + muhat * np.power(self.sigma0, 2)) / np.power(Ds_err, 2),
-            np.sqrt((np.power(self.sigma0, 2) * np.power(muhat_err, 2)) / np.power(Ds_err, 2)))
-        delM = samples['Ds'] - mu
-        samples['mu'] = mu
-        samples['delM'] = delM
-        samples['delta'] = samples['mu'] - muhat[None, None, ...]
-
-        with open(os.path.join(output, 'chains.pkl'), 'wb') as file:
+        with open(os.path.join(outputdir, 'chains.pkl'), 'wb') as file:
             pickle.dump({**samples, **extras}, file)
-
-        summary = arviz.summary(samples)
-        summary.to_csv(os.path.join(output, 'fit_summary.csv'))
-
-        df = pd.DataFrame(self.sn_list, columns=['sn'])
-        if self.deltas is not None:
-            df['true_deltat'] = self.deltas
-        df.to_csv(os.path.join(output, 'sn_list.txt'), index=False, header=True)
-
+        arviz.summary(samples).to_csv(os.path.join(outputdir, 'fit_summary.csv'))
+        table.to_csv(os.path.join(outputdir, 'sn_list.txt'), index=False)
         return samples
 
     # --- Simulation ---
@@ -1222,10 +1143,6 @@ class SEDmodel:
         param_dict : dict
             Parameter values for each simulated object.
         """
-        self.used_band_inds = self._full_used_band_inds
-        self.zps = self._full_zps
-        self.offsets = self._full_offsets
-
         if del_M is None:
             del_M = self.sample_del_M(N)
         else:
@@ -1294,12 +1211,16 @@ class SEDmodel:
         for band in bands_arr:
             if band not in self.band_dict:
                 raise ValueError(f'{band} not present in filters yaml file')
+            if self.band_dict[band] not in self.used_band_dict:
+                loaded = [self.inv_band_dict[i] for i in self.used_band_inds[1:]]
+                raise ValueError(f'{band} is not one of the bands loaded by process_dataset ({loaded}); simulate it '
+                                 f'with a new SEDmodel')
 
         if mjds.shape[0] == num_bands:
             # Flat mode: one band per observation
             mjds_flat = mjds
             per_obs_bands = bands_arr.copy()
-            band_indices = np.array([self.band_dict[b] for b in bands_arr], dtype=int)
+            band_indices = np.array([self.used_band_dict[self.band_dict[b]] for b in bands_arr], dtype=int)
         else:
             # Grid mode: each MJD observed in every band (band-major order)
             num_per_band = mjds.shape[0]
@@ -1307,7 +1228,7 @@ class SEDmodel:
             per_obs_bands = np.repeat(bands_arr, num_per_band)
             band_indices = np.zeros(num_bands * num_per_band, dtype=int)
             for i, band in enumerate(bands_arr):
-                band_indices[i * num_per_band: (i + 1) * num_per_band] = self.band_dict[band]
+                band_indices[i * num_per_band: (i + 1) * num_per_band] = self.used_band_dict[self.band_dict[band]]
         band_indices = band_indices[:, None, None].repeat(num_image, axis=1).repeat(N, axis=2)
 
         mask = np.ones_like(band_indices)
@@ -1347,92 +1268,7 @@ class SEDmodel:
         data = np.random.normal(data, yerr)
 
         if save_to is not None:
-            self._write_simulated_lc(
-                save_to, mjds_flat, per_obs_bands,
-                peak_mjds, z, ebv_mw, np.asarray(data), np.asarray(yerr),
-                param_dict, mag,
-            )
+            write_ecsv(save_to, mjds_flat, per_obs_bands, peak_mjds, z, ebv_mw,
+                       np.asarray(data), np.asarray(yerr), mag, param_dict)
 
         return data, yerr, param_dict
-
-    @staticmethod
-    def _read_ecsv_metadata(path):
-        """Return the ECSV YAML metadata dict, or None if the file isn't ECSV."""
-        try:
-            import astropy.table as at
-        except ImportError:
-            return None
-        try:
-            with open(path, 'r') as f:
-                first_line = f.readline()
-        except (OSError, UnicodeDecodeError):
-            return None
-        if not first_line.startswith('# %ECSV'):
-            return None
-        try:
-            tab = at.Table.read(path, format='ascii.ecsv')
-        except Exception:
-            return None
-        return dict(tab.meta) if tab.meta else None
-
-    def _write_simulated_lc(self, save_to, mjds_flat, per_obs_band_names,
-                            peak_mjds, z, ebv_mw, data, yerr, param_dict, mag):
-        """Write simulated light curve(s) to ECSV files (one per SN).
-
-        Images are labelled 'A', 'B', 'C', ... in the ``image`` column, in the
-        same order as ``peak_mjds[n, :]``. On readback, ``process_dataset``
-        sorts unique labels alphabetically to recover the same ordering.
-        """
-        import astropy.table as at
-
-        n_total_obs, n_images, N = data.shape
-        image_labels = [chr(ord('A') + i) for i in range(n_images)]
-
-        root, ext = os.path.splitext(save_to)
-        if not ext:
-            ext = '.ecsv'
-
-        for n in range(N):
-            rows = []
-            for obs in range(n_total_obs):
-                for img in range(n_images):
-                    val = float(data[obs, img, n])
-                    err = float(yerr[obs, img, n])
-                    if mag:
-                        m, merr = val, err
-                        flux = 10 ** ((27.5 - m) / 2.5)
-                        flux_err = (np.log(10) / 2.5) * merr * flux
-                    else:
-                        flux, flux_err = val, err
-                        m = 27.5 - 2.5 * np.log10(flux) if flux > 0 else np.nan
-                        merr = (2.5 / np.log(10)) * flux_err / flux if flux > 0 else np.nan
-                    rows.append((
-                        float(mjds_flat[obs]),
-                        str(per_obs_band_names[obs]),
-                        flux, flux_err, m, merr,
-                        image_labels[img],
-                    ))
-            tab = at.Table(
-                rows=rows,
-                names=('mjd', 'filter', 'flux', 'fluxerr', 'mag', 'magerr', 'image'),
-            )
-            tab.meta = {
-                'z': float(z[n]),
-                'ebv_mw': float(ebv_mw[n]),
-                'peak_mjds': [float(v) for v in peak_mjds[n, :]],
-                'true_mu': [float(v) for v in param_dict['mu'][n, :]],
-                'true_theta': float(param_dict['theta'][n]),
-                'true_AV': float(param_dict['AV'][n]),
-                'true_RV': float(param_dict['RV'][n]),
-                'true_del_M': float(param_dict['del_M'][n]),
-                'bayesn_td_version': __import__('bayesn_td').__version__,
-            }
-
-            if N == 1:
-                path = root + ext
-            else:
-                path = f'{root}_{n}{ext}'
-            out_dir = os.path.dirname(path)
-            if out_dir and not os.path.exists(out_dir):
-                os.makedirs(out_dir)
-            tab.write(path, format='ascii.ecsv', overwrite=True)

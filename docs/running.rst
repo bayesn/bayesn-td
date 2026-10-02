@@ -45,12 +45,11 @@ A typical input file looks like:
       peak_mjds: [60000.0, 60050.0, 60080.0]
       z: 1.5
       ebv_mw: 0.05
-      band_map:
+      map:
         f150w: F150W
         f200w: F200W
       error_floor:
         F150W: 0.06
-      sn_name: my_sn
 
 Each key is described in the following sections.
 
@@ -72,33 +71,46 @@ Top-level keys
 - ``include_ml`` — whether to include the microlensing GP. Default: ``true``.
 - ``outputdir`` — directory for output files. Default: ``results/`` in the
   current working directory.
+- ``filters`` — path to a custom filter YAML file (optional).
+
+Any other top-level key raises an error.
 
 Data keys
 ~~~~~~~~~~
 
-The ``data`` block specifies the photometry and metadata. Column names are
+The ``data`` block is passed directly to ``SEDmodel.process_dataset``, so its
+keys are that method's arguments (see :ref:`fitting`). Column names are
 auto-detected from the file header; you only need to specify them if your
 file uses non-standard names.
 
-- ``photometry`` — path to the photometry file (whitespace-delimited,
-  CSV, or ECSV).
+- ``photometry`` — the photometry: a file, a directory, a glob pattern
+  (e.g. ``sims/sim_*.ecsv``), or a list of these. See
+  :ref:`fitting` for fitting many SNe at once and the supported formats.
+- ``format`` — ``table``, ``fits`` or ``lsst_lensed_pickle``. Detected from
+  the file content by default.
 - ``image_col``, ``time_col``, ``band_col`` — column name overrides
   (optional; auto-detected by default).
 - ``mag_col``, ``magerr_col`` — magnitude column name overrides (optional).
 - ``flux_col``, ``fluxerr_col`` — flux column name overrides (optional;
-  must be FLUXCAL system, zeropoint 27.5).
-- ``peak_mjds`` — estimated peak MJD for each image, ordered by
-  sorted unique values of the image column. Optional if the photometry file
-  is ECSV with ``peak_mjds`` in its header.
-- ``z`` — source redshift. Optional if read from ECSV header.
-- ``ebv_mw`` — Milky Way :math:`E(B-V)`. Optional if read from ECSV header.
-- ``band_map`` — mapping from data band names to BayeSN filter names
-  (optional).
-- ``error_floor`` — per-band error floor in magnitudes (optional).
+  FLUXCAL system, zeropoint 27.5, or rescaled from a ``zp`` column).
 - ``time_format`` — ``mjd`` (default) or ``phase``.
-- ``sn_name`` — a name for the SN, used in output files (optional).
-- ``true_delta_t`` — true time delays, if known (e.g. for simulated data).
-  Recorded in the output for comparison but not used in fitting.
+- ``true_values`` — for SNANA FITS files, use the simulated true header
+  values instead of the observed ones (default ``false``).
+- ``peak_mjds`` — estimated peak MJD for each image, ordered by
+  sorted unique values of the image column. Optional if given in the file
+  header or a ``metadata`` table.
+- ``z`` — source redshift. Optional if given in the file header or a
+  ``metadata`` table.
+- ``ebv_mw`` — Milky Way :math:`E(B-V)`. Optional if given in the file header
+  or a ``metadata`` table.
+- ``metadata`` — path to a table of per-SN values keyed by an ``SNID`` column
+  (optional).
+- ``drop_bands`` — bands to leave out, named as in the data (optional).
+- ``map`` — mapping from data band names to BayeSN filter names (``filt_map`` in Python)
+  (optional).
+- ``error_floor`` — per-band error floor in magnitudes, keyed by BayeSN filter
+  name (optional).
+- ``sigma_psf`` — PSF uncertainty in magnitudes (optional).
 
 Command-line overrides
 -----------------------

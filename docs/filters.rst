@@ -14,7 +14,7 @@ Built-in filters
 bayesn-td includes the following filters, grouped by instrument, survey, or
 system. The name shown is the string to use when referring to the filter
 within bayesn-td (e.g. ``g_PS1`` for Pan-STARRS 1 *g*-band). If the names in
-your data files do not match these, you can provide a ``band_map`` to match
+your data files do not match these, you can provide a ``filt_map`` (``map`` in a YAML input file) to match
 them up, as discussed in :ref:`fitting`.
 
 - Standard

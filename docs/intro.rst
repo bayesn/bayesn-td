@@ -59,7 +59,8 @@ and the time delays ``delta_t`` are defined as
 :math:`\Delta t_{0i} = \mathrm{peak\_mjd}^{(0)} - \mathrm{peak\_mjd}^{(i)}`
 in observer-frame days. Negative values mean image :math:`i` arrives
 later than image 0 (i.e. has a larger peak MJD). Alternatively, if your times
-are already in rest-frame phase, you can set ``time_format='phase'``.
+are already rest-frame phases relative to each image's peak, you can set
+``time_format='phase'``.
 
 GPU acceleration
 -----------------

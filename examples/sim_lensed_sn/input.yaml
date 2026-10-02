@@ -18,4 +18,3 @@ outputdir: results/sim_lensed_sn
 # the ECSV file header.
 data:
   photometry: examples/sim_lensed_sn/photometry.ecsv
-  sn_name: sim_lensed_sn

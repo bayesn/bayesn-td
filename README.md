@@ -45,11 +45,19 @@ from bayesn_td import SEDmodel
 model = SEDmodel()
 samples = model.fit_lensed_sn(
     photometry='examples/sim_lensed_sn/photometry.ecsv',
-    output='results/sim_lensed_sn',
+    outputdir='results/sim_lensed_sn',
 )
 ```
 
 See `examples/sim_lensed_sn/README.md` for the true input parameters used to generate the simulation.
+
+Many SNe can be fitted in one call by passing a directory, a glob pattern or a list of files:
+
+```python
+model = SEDmodel()
+model.process_dataset('sims/sim_*.ecsv')
+samples = model.fit(outputdir='results/sims')
+```
 
 ## Citation
 
